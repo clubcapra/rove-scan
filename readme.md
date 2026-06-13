@@ -9,7 +9,7 @@ pip install -r requirements.txt
 
 Add `.local/bin` to path (if you want to use it from anywhere). Add this to your `.bashrc`/`.zshrc`
 ```bash
-FPATH+=":/home/$USER/.local/bin"
+export PATH=$PATH:~/.local/bin
 ```
 
 Make sure `.local/bin` exists and link the file there
