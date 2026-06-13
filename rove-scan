@@ -51,7 +51,7 @@ DEVICES = {
     "Compute Rove": [
         ("pi",            2),
         ("jetson",        3),
-    ]
+    ],
     "Comms": [
         ("lte rove",      7),
         ("uhard rove",   10),
