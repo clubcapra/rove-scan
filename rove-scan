@@ -42,18 +42,20 @@ from rich.text import Text
 SUBNET = "192.168.2"
 
 DEVICES = {
-    "Compute": [
+    "Station": [
+        ("steamdeck",     4),
+        ("lte station",   8),
+        ("uhard station",11),
+        ("LoRa station", 13),
+    ],
+    "Compute Rove": [
         ("pi",            2),
         ("jetson",        3),
-        ("steamdeck",     4),
-    ],
+    ]
     "Comms": [
         ("lte rove",      7),
-        ("lte station",   8),
         ("uhard rove",   10),
-        ("uhard station",11),
         ("LoRa rove",    12),
-        ("LoRa station", 13),
     ],
     "LiDAR": [
         ("livox bottom", 40),
