@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""
+netmon.py — live network status dashboard for the rover / station rig.
+
+Pings every device in parallel and shows a colour-coded, grouped table that
+refreshes on an interval. Latency is shown in ms, and any state change
+(device dropping or recovering) is appended to a log file.
+
+Requires: rich   ->   pip install rich
+
+Examples:
+    ./netmon.py                       # live dashboard, 2s refresh
+    ./netmon.py -i 5                  # refresh every 5 seconds
+    ./netmon.py --once                # single snapshot then exit
+    ./netmon.py --log /var/log/netmon.log
+"""
+
+import argparse
+import json
+import platform
+import re
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+from rich import box
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+# ---------------------------------------------------------------------------
+# CONFIG — edit device names / IP last-octets here
+# ---------------------------------------------------------------------------
+SUBNET = "192.168.2"
+
+DEVICES = {
+    "Compute": [
+        ("pi",            2),
+        ("jetson",        3),
+        ("steamdeck",     4),
+    ],
+    "Comms": [
+        ("lte rove",      7),
+        ("lte station",   8),
+        ("uhard rove",   10),
+        ("uhard station",11),
+        ("LoRa rove",    12),
+        ("LoRa station", 13),
+    ],
+    "LiDAR": [
+        ("livox bottom", 40),
+        ("livox top",    41),
+    ],
+    "Cameras": [
+        ("cam rear",     31),
+        ("cam right",    32),
+        ("cam left",     33),
+        ("cam back",     34),
+        ("cam forward",  35),
+        ("cam arm",      36),
+    ],
+    "Other": [
+        ("ovis",         50),
+    ],
+}
+
+DEFAULT_LOG = "netmon.log"
+DEFAULT_DISCOVER = "http://192.168.2.2:8080/discover"
+
+# zebra-striping background for alternate rows, and the category-header bar
+ZEBRA_BG = "on grey15"
+HEADER_BG = "on grey23"
+
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DeviceState:
+    name: str
+    ip: str
+    up: bool = False
+    latency: Optional[float] = None
+    since: Optional[datetime] = None  # when the current state began
+
+
+def ping(ip: str, timeout: float = 1.0):
+    """Ping once. Return (is_up, latency_ms_or_None)."""
+    system = platform.system().lower()
+    if system == "windows":
+        cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+    elif system == "darwin":  # macOS uses -W in milliseconds
+        cmd = ["ping", "-c", "1", "-W", str(int(timeout * 1000)), ip]
+    else:  # linux: -W in seconds
+        cmd = ["ping", "-c", "1", "-W", str(max(1, int(round(timeout)))), ip]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout + 2
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False, None
+
+    if result.returncode != 0:
+        return False, None
+
+    m = re.search(r"time[=<]\s*([\d.]+)", result.stdout)
+    latency = float(m.group(1)) if m else None
+    return True, latency
+
+
+class Monitor:
+    def __init__(self, groups, timeout, logpath, hidden=None):
+        self.groups = groups
+        self.timeout = timeout
+        self.logpath = logpath
+        self.hidden = hidden or set()
+        self.state = {}
+        for items in groups.values():
+            for name, octet in items:
+                ip = f"{SUBNET}.{octet}"
+                self.state[ip] = DeviceState(name=name, ip=ip)
+        self._baseline_done = False
+        self._log(f"monitor started — watching {len(self.state)} devices")
+
+    def _flat(self):
+        out = []
+        for items in self.groups.values():
+            for name, octet in items:
+                out.append((name, f"{SUBNET}.{octet}"))
+        return out
+
+    def poll(self):
+        flat = self._flat()
+        with ThreadPoolExecutor(max_workers=min(32, len(flat))) as ex:
+            futs = {ex.submit(ping, ip, self.timeout): ip for _, ip in flat}
+            for fut in as_completed(futs):
+                ip = futs[fut]
+                up, lat = fut.result()
+                self._update(ip, up, lat)
+        self._baseline_done = True
+
+    def _update(self, ip, up, lat):
+        st = self.state[ip]
+        st.latency = lat if up else None
+        changed = st.up != up
+        if changed and self._baseline_done:
+            self._log_change(st.name, ip, up)
+        if changed or st.since is None:
+            st.up = up
+            st.since = datetime.now()
+
+    def _log_change(self, name, ip, up):
+        word = "RECOVERED" if up else "DROPPED"
+        self._log(f"{word:10} {name} ({ip})")
+
+    def _log(self, msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(self.logpath, "a") as f:
+                f.write(f"{ts}  {msg}\n")
+        except OSError:
+            pass  # never let logging kill the dashboard
+
+    @property
+    def up_count(self):
+        return sum(1 for s in self.state.values() if s.up)
+
+
+class DiscoverMonitor:
+    """Polls an HTTP /discover endpoint and tracks each sensor's presence.
+
+    A sensor in the latest successful response is UP; one seen before but now
+    absent is DOWN (logged). If the endpoint itself can't be reached, all
+    sensors show UNKNOWN and only the endpoint state change is logged, so a
+    discovery blip doesn't emit a drop line for every sensor.
+    """
+
+    def __init__(self, url, logpath, timeout):
+        self.url = url
+        self.logpath = logpath
+        self.timeout = timeout
+        self.reachable = None  # None=unknown, True, False
+        self.sensors = {}      # id -> {"name", "up": True/False/None, "since"}
+        self._baseline_done = False
+
+    def _fetch(self):
+        try:
+            req = urllib.request.Request(
+                self.url, headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                if r.getcode() != 200:
+                    return None
+                return json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError):
+            return None
+
+    def poll(self):
+        data = self._fetch()
+        now = datetime.now()
+
+        if data is None:  # endpoint unreachable
+            if self.reachable is not False:
+                if self._baseline_done:
+                    self._log(f"DISCOVER   unreachable ({self.url})")
+                self.reachable = False
+            for s in self.sensors.values():
+                s["up"] = None
+            self._baseline_done = True
+            return
+
+        if self.reachable is not True:
+            if self._baseline_done and self.reachable is False:
+                self._log("DISCOVER   recovered")
+            self.reachable = True
+
+        present = {}
+        for item in data.get("sensors", []):
+            sid = item.get("id")
+            if sid:
+                present[sid] = item.get("display_name") or sid
+
+        # present sensors -> UP (add new ones dynamically)
+        for sid, name in present.items():
+            s = self.sensors.get(sid)
+            if s is None:
+                self.sensors[sid] = {"name": name, "up": True, "since": now}
+                if self._baseline_done:
+                    self._log(f"APPEARED   {name} ({sid})")
+            else:
+                s["name"] = name
+                if s["up"] is not True:
+                    s["up"] = True
+                    s["since"] = now
+                    if self._baseline_done:
+                        self._log(f"RECOVERED  {name} ({sid})")
+
+        # known but absent -> DOWN
+        for sid, s in self.sensors.items():
+            if sid not in present and s["up"] is not False:
+                s["up"] = False
+                s["since"] = now
+                if self._baseline_done:
+                    self._log(f"DROPPED    {s['name']} ({sid})")
+
+        self._baseline_done = True
+
+    def _log(self, msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(self.logpath, "a") as f:
+                f.write(f"{ts}  {msg}\n")
+        except OSError:
+            pass
+
+    @property
+    def up_count(self):
+        return sum(1 for s in self.sensors.values() if s["up"] is True)
+
+
+def _fmt_latency(ms):
+    if ms is None:
+        return Text("up", style="green")
+    style = "green" if ms < 50 else "yellow" if ms < 150 else "red"
+    return Text(f"{ms:.1f} ms", style=style)
+
+
+def _fmt_since(dt):
+    if dt is None:
+        return ""
+    secs = int((datetime.now() - dt).total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60}m"
+
+
+def local_ips(subnet):
+    """Best-effort set of this machine's own IPv4 addresses."""
+    ips = set()
+    # source IP the OS would use to reach this subnet (no packet is sent)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((f"{subnet}.1", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    # Linux: lists every assigned address
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True,
+                             text=True, timeout=2)
+        ips.update(out.stdout.split())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # hostname resolution as a fallback
+    try:
+        ips.update(i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None))
+    except OSError:
+        pass
+    return {ip for ip in ips if ip and not ip.startswith("127.")}
+
+
+def filter_groups(groups, hidden_ips):
+    """Drop devices whose IP is in hidden_ips; drop groups left empty."""
+    out = {}
+    for group, items in groups.items():
+        kept = [(n, o) for n, o in items if f"{SUBNET}.{o}" not in hidden_ips]
+        if kept:
+            out[group] = kept
+    return out
+
+
+def _device_status(st):
+    """Return (status_text, latency_renderable) for a DeviceState."""
+    if st.up:
+        return Text("\u25cf UP", style="bold green"), _fmt_latency(st.latency)
+    return Text("\u25cf DOWN", style="bold red"), Text("\u2014", style="dim red")
+
+
+def render(mon: Monitor, interval: float, compressed: bool = False) -> Panel:
+    box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
+    table = Table(box=box_style, expand=True, pad_edge=False)
+    table.add_column("Device", style="bold", no_wrap=True)
+    table.add_column("IP", style="dim", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Latency", justify="right", no_wrap=True)
+    table.add_column("Since", justify="right", style="dim", no_wrap=True)
+
+    zebra = 0  # counts data rows only, for alternating background
+
+    def add_device(name, octet, indent):
+        nonlocal zebra
+        ip = f"{SUBNET}.{octet}"
+        status, lat = _device_status(mon.state[ip])
+        rowstyle = ZEBRA_BG if zebra % 2 else None
+        zebra += 1
+        table.add_row(f"{indent}{name}", ip, status, lat,
+                      _fmt_since(mon.state[ip].since), style=rowstyle)
+
+    if compressed:
+        # flat list, no category headers, no section gaps
+        for items in mon.groups.values():
+            for name, octet in items:
+                add_device(name, octet, "")
+    else:
+        for group, items in mon.groups.items():
+            table.add_row(Text(group.upper(), style="bold cyan"),
+                          "", "", "", "", style=HEADER_BG)
+            for name, octet in items:
+                add_device(name, octet, "  ")
+            table.add_section()
+
+    up, total = mon.up_count, len(mon.state)
+    tcolor = "green" if up == total else "red" if up == 0 else "yellow"
+    title = Text(
+        f"Rover Network Monitor — {up}/{total} up — {datetime.now():%H:%M:%S}",
+        style=f"bold {tcolor}",
+    )
+    extra = " · self hidden" if mon.hidden else ""
+    subtitle = Text(
+        f"refresh {interval:g}s · log: {mon.logpath}{extra} · Ctrl-C to quit",
+        style="dim",
+    )
+    pad = (0, 1)
+    return Panel(table, title=title, subtitle=subtitle,
+                 border_style=tcolor, padding=pad)
+
+
+def render_sensors(dmon: DiscoverMonitor, compressed: bool = False) -> Panel:
+    box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
+    table = Table(box=box_style, expand=True, pad_edge=False)
+    table.add_column("Sensor", style="bold", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Since", justify="right", style="dim", no_wrap=True)
+
+    if not dmon.sensors:
+        msg = "discover unreachable" if dmon.reachable is False else "none discovered yet"
+        table.add_row(Text(f"({msg})", style="dim"), "", "")
+    else:
+        for i, (sid, s) in enumerate(sorted(dmon.sensors.items(),
+                                     key=lambda kv: kv[1]["name"].lower())):
+            up = s["up"]
+            if up is True:
+                status = Text("\u25cf UP", style="bold green")
+            elif up is False:
+                status = Text("\u25cf DOWN", style="bold red")
+            else:
+                status = Text("\u25cf UNKNOWN", style="bold yellow")
+            rowstyle = ZEBRA_BG if i % 2 else None
+            table.add_row(s["name"], status, _fmt_since(s["since"]), style=rowstyle)
+
+    up, total = dmon.up_count, len(dmon.sensors)
+    if dmon.reachable is False:
+        tcolor = "red"
+        title = Text(f"Sensors — discover UNREACHABLE — {dmon.url}",
+                     style="bold red")
+    else:
+        tcolor = "green" if total and up == total else "yellow" if up else "red"
+        title = Text(f"Sensors — {up}/{total} up — {dmon.url}",
+                     style=f"bold {tcolor}")
+    return Panel(table, title=title, border_style=tcolor, padding=(0, 1))
+
+
+def compose(mon, dmon, interval, compressed=False):
+    device_panel = render(mon, interval, compressed)
+    if dmon is None:
+        return device_panel
+    return Group(device_panel, render_sensors(dmon, compressed))
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Live network status dashboard.")
+    p.add_argument("-i", "--interval", type=float, default=2.0,
+                   help="seconds between refreshes (default: 2)")
+    p.add_argument("-t", "--timeout", type=float, default=1.0,
+                   help="ping timeout in seconds (default: 1)")
+    p.add_argument("-l", "--log", default=DEFAULT_LOG,
+                   help=f"log file path (default: {DEFAULT_LOG})")
+    p.add_argument("--discover-url", default=DEFAULT_DISCOVER,
+                   help=f"sensor discovery endpoint (default: {DEFAULT_DISCOVER})")
+    p.add_argument("--no-discover", action="store_true",
+                   help="disable the /discover sensor monitor")
+    p.add_argument("--once", action="store_true",
+                   help="print a single snapshot and exit")
+    p.add_argument("-c", "--compressed", action="store_true",
+                   help="flat view: no categories, no spacing")
+    p.add_argument("--show-self", action="store_true",
+                   help="don't hide this machine's own IP")
+    return p.parse_args()
+
+
+def _poll_all(mon, dmon):
+    """Poll the ping sweep and the discover endpoint concurrently."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [ex.submit(mon.poll)]
+        if dmon is not None:
+            futs.append(ex.submit(dmon.poll))
+        for f in futs:
+            f.result()
+
+
+def main():
+    args = parse_args()
+    console = Console()
+
+    hidden = set() if args.show_self else local_ips(SUBNET)
+    groups = filter_groups(DEVICES, hidden)
+    mon = Monitor(groups, timeout=args.timeout, logpath=args.log, hidden=hidden)
+    dmon = None
+    if not args.no_discover:
+        dmon = DiscoverMonitor(args.discover_url, logpath=args.log,
+                               timeout=max(args.timeout, 2.0))
+
+    if args.once:
+        _poll_all(mon, dmon)
+        console.print(compose(mon, dmon, args.interval, args.compressed))
+        return
+
+    try:
+        _poll_all(mon, dmon)  # first frame has data immediately
+        with Live(compose(mon, dmon, args.interval, args.compressed),
+                  console=console, screen=True, auto_refresh=False) as live:
+            while True:
+                time.sleep(args.interval)
+                _poll_all(mon, dmon)
+                live.update(compose(mon, dmon, args.interval, args.compressed))
+                live.refresh()
+    except KeyboardInterrupt:
+        console.print("[dim]stopped.[/dim]")
+
+
+if __name__ == "__main__":
+    main()
