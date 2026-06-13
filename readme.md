@@ -15,7 +15,7 @@ export PATH=$PATH:~/.local/bin
 Make sure `.local/bin` exists and link the file there
 ```bash
 mkdir -p ~/.local/bin
-ln -s /path/to/rove-scan ~/.local/bin/rove-scan
+ln -s /path/to/rove-scan/rove-scan ~/.local/bin/rove-scan
 ```
 
 ## Usage
