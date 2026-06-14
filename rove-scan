@@ -25,11 +25,12 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 from rich import box
+from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -71,6 +72,7 @@ DEVICES = {
     ],
     "Other": [
         ("ovis",         50),
+        ("sim",           5),
     ],
 }
 
@@ -80,6 +82,9 @@ DEFAULT_DISCOVER = "http://192.168.2.2:8080/discover"
 # zebra-striping background for alternate rows, and the category-header bar
 ZEBRA_BG = "on grey15"
 HEADER_BG = "on grey23"
+
+# how many ping samples to keep per device for the history graph
+MAX_HISTORY = 512
 
 # ---------------------------------------------------------------------------
 
@@ -91,6 +96,7 @@ class DeviceState:
     up: bool = False
     latency: Optional[float] = None
     since: Optional[datetime] = None  # when the current state began
+    history: list = field(default_factory=list)  # latency per poll; None = lost
 
 
 def ping(ip: str, timeout: float = 1.0):
@@ -152,6 +158,10 @@ class Monitor:
     def _update(self, ip, up, lat):
         st = self.state[ip]
         st.latency = lat if up else None
+        # up-but-unparsed latency -> 0.0 (min bar); down -> None (max bar)
+        st.history.append((lat if lat is not None else 0.0) if up else None)
+        if len(st.history) > MAX_HISTORY:
+            del st.history[:-MAX_HISTORY]
         changed = st.up != up
         if changed and self._baseline_done:
             self._log_change(st.name, ip, up)
@@ -268,11 +278,92 @@ class DiscoverMonitor:
         return sum(1 for s in self.sensors.values() if s["up"] is True)
 
 
+# --- braille ping-history graph --------------------------------------------
+# A braille cell is a 2-wide x 4-tall dot grid, so one character holds two
+# samples side by side, each a bar 1-4 dots tall (filled from the bottom).
+BRAILLE_BASE = 0x2800
+_LEFT_DOTS = (0x40, 0x04, 0x02, 0x01)   # bottom -> top, left sub-column
+_RIGHT_DOTS = (0x80, 0x20, 0x10, 0x08)  # bottom -> top, right sub-column
+
+
+def _col_bits(dots, height):
+    bits = 0
+    for i in range(min(height, 4)):
+        bits |= dots[i]
+    return bits
+
+
+def _braille_line(heights, width):
+    """Render bar heights (0-4 dots each) into `width` braille chars,
+    most-recent sample on the right, older samples padded blank on the left."""
+    n = 2 * width
+    h = list(heights)[-n:]
+    h = [0] * (n - len(h)) + h
+    out = []
+    for i in range(0, n, 2):
+        out.append(chr(BRAILLE_BASE
+                       | _col_bits(_LEFT_DOTS, h[i])
+                       | _col_bits(_RIGHT_DOTS, h[i + 1])))
+    return "".join(out)
+
+
+def _device_graph(st, width):
+    """Braille sparkline of a device's ping history. Live pings use the full
+    height of the cell (4 dots), autoscaled to the window's max ping. A lost
+    ping shows a full-height bar coloured red, so drops stand out even though
+    they now share the top of the scale with the slowest ping."""
+    n = 2 * width
+    window = st.history[-n:]
+    vals = [s for s in window if s is not None]
+    lmax = max(vals) if vals else None
+    samples = []  # (height 0-4, lost?, latency)
+    for s in window:
+        if s is None:                       # lost ping -> full height, red
+            samples.append((4, True, None))
+        elif not lmax:                      # all-zero window
+            samples.append((1, False, s))
+        else:                               # 1..4, max ping reaches the top
+            samples.append((max(1, round(s / lmax * 4)), False, s))
+    samples = [(0, False, None)] * (n - len(samples)) + samples  # left-pad blank
+
+    text = Text()
+    for i in range(0, n, 2):
+        lh, llost, llat = samples[i]
+        rh, rlost, rlat = samples[i + 1]
+        code = BRAILLE_BASE | _col_bits(_LEFT_DOTS, lh) | _col_bits(_RIGHT_DOTS, rh)
+        if llost or rlost:                  # a dropped ping in this pair -> red
+            style = "red"
+        else:
+            lats = [x for x in (llat, rlat) if x is not None]
+            style = _latency_color(max(lats)) if lats else "dim"
+        text.append(chr(code), style=style)
+    return text
+
+
+def _latency_color(ms):
+    if ms is None:
+        return "red"
+    return "green" if ms < 50 else "yellow" if ms < 150 else "red"
+
+
+def _flex_width(console, fixed, struct):
+    """Width left for the flexible graph column: the terminal width minus the
+    natural widths of the fixed columns and a per-table structural constant
+    (box, cell padding and the enclosing Panel). `struct` is calibrated per
+    table: 21 for the 6-column device table, 15 for the 4-column sensor one."""
+    return max(8, console.width - sum(fixed) - struct)
+
+
+def _max_graph(width, color):
+    """A full-height (max) braille bar — used for API/discovered devices that
+    have no ping latency to plot."""
+    return Text(_braille_line([4] * (2 * width), width), style=color)
+
+
 def _fmt_latency(ms):
     if ms is None:
         return Text("up", style="green")
-    style = "green" if ms < 50 else "yellow" if ms < 150 else "red"
-    return Text(f"{ms:.1f} ms", style=style)
+    return Text(f"{ms:.1f} ms", style=_latency_color(ms))
 
 
 def _fmt_since(dt):
@@ -329,7 +420,8 @@ def _device_status(st):
     return Text("\u25cf DOWN", style="bold red"), Text("\u2014", style="dim red")
 
 
-def render(mon: Monitor, interval: float, compressed: bool = False) -> Panel:
+def render(mon: Monitor, interval: float, console: Console,
+           compressed: bool = False) -> Panel:
     box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
     table = Table(box=box_style, expand=True, pad_edge=False)
     table.add_column("Device", style="bold", no_wrap=True)
@@ -337,17 +429,35 @@ def render(mon: Monitor, interval: float, compressed: bool = False) -> Panel:
     table.add_column("Status", justify="center", no_wrap=True)
     table.add_column("Latency", justify="right", no_wrap=True)
     table.add_column("Since", justify="right", style="dim", no_wrap=True)
+    table.add_column("Ping", justify="right", no_wrap=True, ratio=1)
+
+    # natural widths of the fixed columns so the graph fills whatever is left
+    dev = [cell_len("Device")]
+    lat = [cell_len("Latency")]
+    since = [cell_len("Since")]
+    for group, items in mon.groups.items():
+        if not compressed:
+            dev.append(cell_len(group.upper()))
+        for name, octet in items:
+            st = mon.state[f"{SUBNET}.{octet}"]
+            dev.append(cell_len(("" if compressed else "  ") + name))
+            lat.append(cell_len(_device_status(st)[1].plain))
+            since.append(cell_len(_fmt_since(st.since)))
+    # IP <= "192.168.2.255" (13); Status <= "● DOWN" (6)
+    gw = _flex_width(console, [max(dev), 13, 6, max(lat), max(since)], 21)
 
     zebra = 0  # counts data rows only, for alternating background
 
     def add_device(name, octet, indent):
         nonlocal zebra
         ip = f"{SUBNET}.{octet}"
-        status, lat = _device_status(mon.state[ip])
+        st = mon.state[ip]
+        status, lat = _device_status(st)
         rowstyle = ZEBRA_BG if zebra % 2 else None
         zebra += 1
         table.add_row(f"{indent}{name}", ip, status, lat,
-                      _fmt_since(mon.state[ip].since), style=rowstyle)
+                      _fmt_since(st.since), _device_graph(st, gw),
+                      style=rowstyle)
 
     if compressed:
         # flat list, no category headers, no section gaps
@@ -357,7 +467,7 @@ def render(mon: Monitor, interval: float, compressed: bool = False) -> Panel:
     else:
         for group, items in mon.groups.items():
             table.add_row(Text(group.upper(), style="bold cyan"),
-                          "", "", "", "", style=HEADER_BG)
+                          "", "", "", "", "", style=HEADER_BG)
             for name, octet in items:
                 add_device(name, octet, "  ")
             table.add_section()
@@ -378,28 +488,46 @@ def render(mon: Monitor, interval: float, compressed: bool = False) -> Panel:
                  border_style=tcolor, padding=pad)
 
 
-def render_sensors(dmon: DiscoverMonitor, compressed: bool = False) -> Panel:
+def render_sensors(dmon: DiscoverMonitor, console: Console,
+                   compressed: bool = False) -> Panel:
     box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
     table = Table(box=box_style, expand=True, pad_edge=False)
     table.add_column("Sensor", style="bold", no_wrap=True)
     table.add_column("Status", justify="center", no_wrap=True)
     table.add_column("Since", justify="right", style="dim", no_wrap=True)
+    table.add_column("Ping", justify="right", no_wrap=True, ratio=1)
+
+    name = [cell_len("Sensor")]
+    stat = [cell_len("Status")]
+    since = [cell_len("Since")]
+    for s in dmon.sensors.values():
+        up = s["up"]
+        txt = "\u25cf UP" if up is True else "\u25cf DOWN" if up is False else "\u25cf UNKNOWN"
+        name.append(cell_len(s["name"]))
+        stat.append(cell_len(txt))
+        since.append(cell_len(_fmt_since(s["since"])))
+    gw = _flex_width(console, [max(name), max(stat), max(since)], 15)
 
     if not dmon.sensors:
         msg = "discover unreachable" if dmon.reachable is False else "none discovered yet"
-        table.add_row(Text(f"({msg})", style="dim"), "", "")
+        table.add_row(Text(f"({msg})", style="dim"), "", "", "")
     else:
         for i, (sid, s) in enumerate(sorted(dmon.sensors.items(),
                                      key=lambda kv: kv[1]["name"].lower())):
             up = s["up"]
             if up is True:
                 status = Text("\u25cf UP", style="bold green")
+                gcolor = "green"
             elif up is False:
                 status = Text("\u25cf DOWN", style="bold red")
+                gcolor = "red"
             else:
                 status = Text("\u25cf UNKNOWN", style="bold yellow")
+                gcolor = "yellow"
             rowstyle = ZEBRA_BG if i % 2 else None
-            table.add_row(s["name"], status, _fmt_since(s["since"]), style=rowstyle)
+            # API/discovered devices have no latency \u2014 show a full (max) bar
+            table.add_row(s["name"], status, _fmt_since(s["since"]),
+                          _max_graph(gw, gcolor), style=rowstyle)
 
     up, total = dmon.up_count, len(dmon.sensors)
     if dmon.reachable is False:
@@ -413,11 +541,11 @@ def render_sensors(dmon: DiscoverMonitor, compressed: bool = False) -> Panel:
     return Panel(table, title=title, border_style=tcolor, padding=(0, 1))
 
 
-def compose(mon, dmon, interval, compressed=False):
-    device_panel = render(mon, interval, compressed)
+def compose(mon, dmon, interval, console, compressed=False):
+    device_panel = render(mon, interval, console, compressed)
     if dmon is None:
         return device_panel
-    return Group(device_panel, render_sensors(dmon, compressed))
+    return Group(device_panel, render_sensors(dmon, console, compressed))
 
 
 def parse_args():
@@ -465,17 +593,18 @@ def main():
 
     if args.once:
         _poll_all(mon, dmon)
-        console.print(compose(mon, dmon, args.interval, args.compressed))
+        console.print(compose(mon, dmon, args.interval, console, args.compressed))
         return
 
     try:
         _poll_all(mon, dmon)  # first frame has data immediately
-        with Live(compose(mon, dmon, args.interval, args.compressed),
+        with Live(compose(mon, dmon, args.interval, console, args.compressed),
                   console=console, screen=True, auto_refresh=False) as live:
             while True:
                 time.sleep(args.interval)
                 _poll_all(mon, dmon)
-                live.update(compose(mon, dmon, args.interval, args.compressed))
+                live.update(compose(mon, dmon, args.interval, console,
+                                    args.compressed))
                 live.refresh()
     except KeyboardInterrupt:
         console.print("[dim]stopped.[/dim]")
