@@ -33,7 +33,6 @@ from rich import box
 from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.live import Live
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -356,12 +355,17 @@ def _ping_color(ms):
     return "green" if ms < 50 else "yellow"
 
 
-def _flex_width(console, fixed, struct):
-    """Width left for the flexible graph column: the terminal width minus the
-    natural widths of the fixed columns and a per-table structural constant
-    (box, cell padding and the enclosing Panel). `struct` is calibrated per
-    table: 21 for the 6-column device table, 15 for the 4-column sensor one."""
-    return max(8, console.width - sum(fixed) - struct)
+def _graph_chars(console, box_style, headers, widths):
+    """How many braille chars the flexible graph column can hold: the terminal
+    width minus the *measured* natural width of the fixed columns. Measured
+    rather than summed because the box/padding overhead isn't a clean constant.
+    The graph cell is then sized to exactly this, with the table at expand=False
+    so the column fills the remaining width without starving the others."""
+    probe = Table(box=box_style, expand=False, pad_edge=False)
+    for h in headers:
+        probe.add_column(h, no_wrap=True)
+    probe.add_row(*["x" * w for w in widths])
+    return max(8, console.width - console.measure(probe).maximum - 3)
 
 
 _SENSOR_STATE = {False: (3, "red"), None: (2, "yellow"), True: (1, "green")}
@@ -449,15 +453,15 @@ def _device_status(st):
 
 
 def render(mon: Monitor, interval: float, console: Console,
-           compressed: bool = False) -> Panel:
+           compressed: bool = False) -> Group:
     box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
-    table = Table(box=box_style, expand=True, pad_edge=False)
+    table = Table(box=box_style, expand=False, pad_edge=False)
     table.add_column("Device", style="bold", no_wrap=True)
     table.add_column("IP", style="dim", no_wrap=True)
     table.add_column("Status", justify="center", no_wrap=True)
     table.add_column("Latency", justify="right", no_wrap=True)
     table.add_column("Since", justify="right", style="dim", no_wrap=True)
-    table.add_column("Ping", justify="right", no_wrap=True, ratio=1)
+    table.add_column("Ping", justify="right", no_wrap=True)
 
     # natural widths of the fixed columns so the graph fills whatever is left
     dev = [cell_len("Device")]
@@ -474,8 +478,10 @@ def render(mon: Monitor, interval: float, console: Console,
             ip_w.append(cell_len(ip))
             lat.append(cell_len(_device_status(st)[1].plain))
             since.append(cell_len(_fmt_since(st.since)))
-    # Status <= "● DOWN" (6)
-    gw = _flex_width(console, [max(dev), max(ip_w), 6, max(lat), max(since)], 21)
+    # Status <= "● DOWN" (6); graph fills the rest of the terminal width
+    gw = _graph_chars(console, box_style,
+                      ["Device", "IP", "Status", "Latency", "Since"],
+                      [max(dev), max(ip_w), 6, max(lat), max(since)])
 
     zebra = 0  # counts data rows only, for alternating background
 
@@ -514,19 +520,17 @@ def render(mon: Monitor, interval: float, console: Console,
         f"refresh {interval:g}s · log: {mon.logpath}{extra} · Ctrl-C to quit",
         style="dim",
     )
-    pad = (0, 1)
-    return Panel(table, title=title, subtitle=subtitle,
-                 border_style=tcolor, padding=pad)
+    return Group(title, table, subtitle)
 
 
 def render_sensors(dmon: DiscoverMonitor, console: Console,
-                   compressed: bool = False) -> Panel:
+                   compressed: bool = False) -> Group:
     box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
-    table = Table(box=box_style, expand=True, pad_edge=False)
+    table = Table(box=box_style, expand=False, pad_edge=False)
     table.add_column("Sensor", style="bold", no_wrap=True)
     table.add_column("Status", justify="center", no_wrap=True)
     table.add_column("Since", justify="right", style="dim", no_wrap=True)
-    table.add_column("Ping", justify="right", no_wrap=True, ratio=1)
+    table.add_column("Ping", justify="right", no_wrap=True)
 
     name = [cell_len("Sensor")]
     stat = [cell_len("Status")]
@@ -537,7 +541,8 @@ def render_sensors(dmon: DiscoverMonitor, console: Console,
         name.append(cell_len(s["name"]))
         stat.append(cell_len(txt))
         since.append(cell_len(_fmt_since(s["since"])))
-    gw = _flex_width(console, [max(name), max(stat), max(since)], 15)
+    gw = _graph_chars(console, box_style, ["Sensor", "Status", "Since"],
+                      [max(name), max(stat), max(since)])
 
     if not dmon.sensors:
         msg = "discover unreachable" if dmon.reachable is False else "none discovered yet"
@@ -566,7 +571,7 @@ def render_sensors(dmon: DiscoverMonitor, console: Console,
         tcolor = "green" if total and up == total else "yellow" if up else "red"
         title = Text(f"Sensors — {up}/{total} up — {dmon.url}",
                      style=f"bold {tcolor}")
-    return Panel(table, title=title, border_style=tcolor, padding=(0, 1))
+    return Group(title, table)
 
 
 def compose(mon, dmon, interval, console, compressed=False):
