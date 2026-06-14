@@ -227,6 +227,7 @@ class DiscoverMonitor:
             for s in self.sensors.values():
                 s["up"] = None
             self._baseline_done = True
+            self._record()
             return
 
         if self.reachable is not True:
@@ -244,7 +245,8 @@ class DiscoverMonitor:
         for sid, name in present.items():
             s = self.sensors.get(sid)
             if s is None:
-                self.sensors[sid] = {"name": name, "up": True, "since": now}
+                self.sensors[sid] = {"name": name, "up": True, "since": now,
+                                     "history": []}
                 if self._baseline_done:
                     self._log(f"APPEARED   {name} ({sid})")
             else:
@@ -264,6 +266,15 @@ class DiscoverMonitor:
                     self._log(f"DROPPED    {s['name']} ({sid})")
 
         self._baseline_done = True
+        self._record()
+
+    def _record(self):
+        """Append each sensor's current state to its history (for the graph)."""
+        for s in self.sensors.values():
+            h = s.setdefault("history", [])
+            h.append(s["up"])  # True=up, False=down, None=unknown
+            if len(h) > MAX_HISTORY:
+                del h[:-MAX_HISTORY]
 
     def _log(self, msg):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -291,20 +302,6 @@ def _col_bits(dots, height):
     for i in range(min(height, 4)):
         bits |= dots[i]
     return bits
-
-
-def _braille_line(heights, width):
-    """Render bar heights (0-4 dots each) into `width` braille chars,
-    most-recent sample on the right, older samples padded blank on the left."""
-    n = 2 * width
-    h = list(heights)[-n:]
-    h = [0] * (n - len(h)) + h
-    out = []
-    for i in range(0, n, 2):
-        out.append(chr(BRAILLE_BASE
-                       | _col_bits(_LEFT_DOTS, h[i])
-                       | _col_bits(_RIGHT_DOTS, h[i + 1])))
-    return "".join(out)
 
 
 def _device_graph(st, width):
@@ -354,10 +351,28 @@ def _flex_width(console, fixed, struct):
     return max(8, console.width - sum(fixed) - struct)
 
 
-def _max_graph(width, color):
-    """A full-height (max) braille bar — used for API/discovered devices that
-    have no ping latency to plot."""
-    return Text(_braille_line([4] * (2 * width), width), style=color)
+_SENSOR_STATE = {False: (3, "red"), None: (2, "yellow"), True: (1, "green")}
+
+
+def _sensor_graph(history, width):
+    """Braille bar of a discovered sensor's presence history. There is no
+    latency, so every sample is full height; the colour follows each char's
+    state (red=down, yellow=unknown, green=up). The bar grows from the right
+    as polls accumulate, rather than starting full-length."""
+    n = 2 * width
+    window = list(history)[-n:]
+    # (height, severity, colour) per sample; pad the left with blank columns
+    cells = [(4,) + _SENSOR_STATE.get(s, (0, "dim")) for s in window]
+    cells = [(0, -1, "dim")] * (n - len(cells)) + cells
+
+    text = Text()
+    for i in range(0, n, 2):
+        lh, lsev, lcol = cells[i]
+        rh, rsev, rcol = cells[i + 1]
+        code = BRAILLE_BASE | _col_bits(_LEFT_DOTS, lh) | _col_bits(_RIGHT_DOTS, rh)
+        style = lcol if lsev >= rsev else rcol  # colour by the worse state
+        text.append(chr(code), style=style)
+    return text
 
 
 def _fmt_latency(ms):
@@ -517,17 +532,14 @@ def render_sensors(dmon: DiscoverMonitor, console: Console,
             up = s["up"]
             if up is True:
                 status = Text("\u25cf UP", style="bold green")
-                gcolor = "green"
             elif up is False:
                 status = Text("\u25cf DOWN", style="bold red")
-                gcolor = "red"
             else:
                 status = Text("\u25cf UNKNOWN", style="bold yellow")
-                gcolor = "yellow"
             rowstyle = ZEBRA_BG if i % 2 else None
-            # API/discovered devices have no latency \u2014 show a full (max) bar
+            # no latency to plot \u2014 a presence timeline coloured by state
             table.add_row(s["name"], status, _fmt_since(s["since"]),
-                          _max_graph(gw, gcolor), style=rowstyle)
+                          _sensor_graph(s.get("history", []), gw), style=rowstyle)
 
     up, total = dmon.up_count, len(dmon.sensors)
     if dmon.reachable is False:
