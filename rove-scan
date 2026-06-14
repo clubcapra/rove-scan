@@ -73,6 +73,7 @@ DEVICES = {
     "Other": [
         ("ovis",         50),
         ("sim",           5),
+        ("google",       "8.8.8.8"),  # internet reachability check
     ],
 }
 
@@ -87,6 +88,12 @@ HEADER_BG = "on grey23"
 MAX_HISTORY = 512
 
 # ---------------------------------------------------------------------------
+
+
+def _addr(octet):
+    """Resolve a device entry's address: an int is a last-octet on SUBNET, a
+    string is used verbatim (e.g. an external host like a public DNS server)."""
+    return f"{SUBNET}.{octet}" if isinstance(octet, int) else str(octet)
 
 
 @dataclass
@@ -133,7 +140,7 @@ class Monitor:
         self.state = {}
         for items in groups.values():
             for name, octet in items:
-                ip = f"{SUBNET}.{octet}"
+                ip = _addr(octet)
                 self.state[ip] = DeviceState(name=name, ip=ip)
         self._baseline_done = False
         self._log(f"monitor started — watching {len(self.state)} devices")
@@ -142,7 +149,7 @@ class Monitor:
         out = []
         for items in self.groups.values():
             for name, octet in items:
-                out.append((name, f"{SUBNET}.{octet}"))
+                out.append((name, _addr(octet)))
         return out
 
     def poll(self):
@@ -422,7 +429,7 @@ def filter_groups(groups, hidden_ips):
     """Drop devices whose IP is in hidden_ips; drop groups left empty."""
     out = {}
     for group, items in groups.items():
-        kept = [(n, o) for n, o in items if f"{SUBNET}.{o}" not in hidden_ips]
+        kept = [(n, o) for n, o in items if _addr(o) not in hidden_ips]
         if kept:
             out[group] = kept
     return out
@@ -448,24 +455,27 @@ def render(mon: Monitor, interval: float, console: Console,
 
     # natural widths of the fixed columns so the graph fills whatever is left
     dev = [cell_len("Device")]
+    ip_w = [cell_len("IP")]
     lat = [cell_len("Latency")]
     since = [cell_len("Since")]
     for group, items in mon.groups.items():
         if not compressed:
             dev.append(cell_len(group.upper()))
         for name, octet in items:
-            st = mon.state[f"{SUBNET}.{octet}"]
+            ip = _addr(octet)
+            st = mon.state[ip]
             dev.append(cell_len(("" if compressed else "  ") + name))
+            ip_w.append(cell_len(ip))
             lat.append(cell_len(_device_status(st)[1].plain))
             since.append(cell_len(_fmt_since(st.since)))
-    # IP <= "192.168.2.255" (13); Status <= "● DOWN" (6)
-    gw = _flex_width(console, [max(dev), 13, 6, max(lat), max(since)], 21)
+    # Status <= "● DOWN" (6)
+    gw = _flex_width(console, [max(dev), max(ip_w), 6, max(lat), max(since)], 21)
 
     zebra = 0  # counts data rows only, for alternating background
 
     def add_device(name, octet, indent):
         nonlocal zebra
-        ip = f"{SUBNET}.{octet}"
+        ip = _addr(octet)
         st = mon.state[ip]
         status, lat = _device_status(st)
         rowstyle = ZEBRA_BG if zebra % 2 else None
