@@ -339,7 +339,7 @@ def _device_graph(st, width):
             style = "red"
         else:
             lats = [x for x in (llat, rlat) if x is not None]
-            style = _latency_color(max(lats)) if lats else "dim"
+            style = _ping_color(max(lats)) if lats else "dim"
         text.append(chr(code), style=style)
     return text
 
@@ -348,6 +348,12 @@ def _latency_color(ms):
     if ms is None:
         return "red"
     return "green" if ms < 50 else "yellow" if ms < 150 else "red"
+
+
+def _ping_color(ms):
+    """Graph colour for a live ping. Never red — red is reserved for a lost
+    connection, so a slow ping (yellow) isn't confused with a drop."""
+    return "green" if ms < 50 else "yellow"
 
 
 def _flex_width(console, fixed, struct):
