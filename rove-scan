@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-netmon.py — live network status dashboard for the rover / station rig.
+netmon.py — live network status dashboard for the rove / station rig.
 
 Pings every device in parallel and shows a colour-coded, grouped table that
 refreshes on an interval. Latency is shown in ms, and any state change
@@ -361,7 +361,7 @@ def _graph_chars(console, box_style, headers, widths):
     rather than summed because the box/padding overhead isn't a clean constant.
     The graph cell is then sized to exactly this, with the table at expand=False
     so the column fills the remaining width without starving the others."""
-    probe = Table(box=box_style, expand=False, pad_edge=False)
+    probe = Table(box=box_style, expand=False, pad_edge=False, show_edge=False)
     for h in headers:
         probe.add_column(h, no_wrap=True)
     probe.add_row(*["x" * w for w in widths])
@@ -455,7 +455,7 @@ def _device_status(st):
 def render(mon: Monitor, interval: float, console: Console,
            compressed: bool = False) -> Group:
     box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
-    table = Table(box=box_style, expand=False, pad_edge=False)
+    table = Table(box=box_style, expand=False, pad_edge=False, show_edge=False)
     table.add_column("Device", style="bold", no_wrap=True)
     table.add_column("IP", style="dim", no_wrap=True)
     table.add_column("Status", justify="center", no_wrap=True)
@@ -507,12 +507,11 @@ def render(mon: Monitor, interval: float, console: Console,
                           "", "", "", "", "", style=HEADER_BG)
             for name, octet in items:
                 add_device(name, octet, "  ")
-            table.add_section()
 
     up, total = mon.up_count, len(mon.state)
     tcolor = "green" if up == total else "red" if up == 0 else "yellow"
     title = Text(
-        f"Rover Network Monitor — {up}/{total} up — {datetime.now():%H:%M:%S}",
+        f"Rove Network Monitor — {up}/{total} up — {datetime.now():%H:%M:%S}",
         style=f"bold {tcolor}",
     )
     extra = " · self hidden" if mon.hidden else ""
@@ -526,7 +525,7 @@ def render(mon: Monitor, interval: float, console: Console,
 def render_sensors(dmon: DiscoverMonitor, console: Console,
                    compressed: bool = False) -> Group:
     box_style = box.SIMPLE if compressed else box.SIMPLE_HEAVY
-    table = Table(box=box_style, expand=False, pad_edge=False)
+    table = Table(box=box_style, expand=False, pad_edge=False, show_edge=False)
     table.add_column("Sensor", style="bold", no_wrap=True)
     table.add_column("Status", justify="center", no_wrap=True)
     table.add_column("Since", justify="right", style="dim", no_wrap=True)
